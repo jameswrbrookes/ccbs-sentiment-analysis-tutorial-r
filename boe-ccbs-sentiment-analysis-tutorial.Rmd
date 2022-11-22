@@ -1,0 +1,523 @@
+---
+title: "An Introduction to Sentiment Analysis in R"
+subtitle: "CCBS Virtual Event -- R for Non-Econometrics"
+author: "James Brookes"
+institute: "Advanced Analytics Division, Bank of England"
+date: "24/11/2022"
+fontsize: 8pt
+output: 
+  beamer_presentation:
+    theme: "Boadilla"
+    slide_level: 3
+classoption: "aspectratio=169"
+---
+
+
+### Agenda 
+
+1. Introduction to Sentiment Analysis
+2. Sentiment Analysis in R 
+
+
+# Sentiment Analysis in R 
+
+## Preliminaries 
+
+### Packages
+
+- Make sure that you have the following packages installed, which you can do with `install.packages(c("tidyverse", "arrow", "glmnet", ...))` 
+
+```{r echo=T, results='hide', message = FALSE}
+library(tidyverse)
+library(arrow)
+library(tidytext)
+library(tokenizers)
+library(yardstick)
+library(tidymodels)
+library(textrecipes)
+library(glmnet)
+library(textfeatures)
+```
+
+### Plot options 
+
+- Colors for the plots
+```{r}
+POS_COLOR <- "#03a5fc" # bluey color 
+NEG_COLOR <- "#fca503" #orangey color 
+```
+- Transparency of fills
+```{r}
+ALPHA <- 0.6
+```
+
+### Problem Definition
+
+- To build a performant sentiment analysis system that classifies movie reviews as `positive` or `negative`
+- Some requirements:
+  - Training data pairs (and test data for evaluation)
+    - each pair being $(text,label)$
+  - Featurization method: 
+    - $\phi : text \rightarrow features$
+  - Evaluation metric: 
+    - e.g. accuracy, $F_1$, AUROC, ...
+  - Model: 
+    - $h : features \rightarrow label \in \{positive,negative\}$
+    
+    - e.g. hand-crafted rules, logistic regression, random forest, FFNN, ... 
+    
+## Data and Data Exploration
+
+### Data
+
+- sample of [Maas et al. (2011)](https://ai.stanford.edu/~ang/papers/acl11-WordVectorsSentimentAnalysis.pdf) IMDB dataset
+- original dataset contains:
+  - 25,000 labeled training observations
+  - 25,000 labeled test observations
+  - 50,000 unlabeled observations
+- our version of their dataset: 
+  - sample of 10,000 of their labeled training observations
+  - sample further split 60/20/20 into pseudo train/dev/test set 
+  - duplicates have been removed, but the text has otherwise not been preprocessed
+  
+### Data Read-In 
+
+```{r eval=TRUE}
+imdb <- arrow::read_parquet("imdb-sample.parquet")
+str(imdb)
+```
+
+### Split Distributions 
+
+```{r}
+imdb %>% count(split) 
+```
+### Label distributions by split 
+
+```{r}
+imdb %>% 
+  group_by(split, label) %>% 
+  summarise(value_counts = n()) %>%
+  mutate(`normalized_counts (%)` = round((value_counts / sum(value_counts) * 100), 2)
+         )
+```
+
+### Split train/dev/test into separate dataframes
+
+```{r}
+train_imdb <- imdb %>% filter(split == "train") %>% select(text, label)
+dev_imdb <- imdb %>% filter(split == "dev") %>% select(text, label)
+test_imdb <- imdb %>% filter(split == "test") %>% select(text, label)
+```
+
+### A note on train/dev/splits and data hygiene 
+
+- The **train** set is used to find the optimal model parameters according to the model's cost function 
+- The **dev** set is used to find the optimal model hyperparameters (e.g., number of units in a NN layer) and other external settings (e.g, such as scaling choices, feature sets, )
+  - N.B. (1) you could use CV here instead or as well as a dev set
+  - N.B. (2) the more you peak into the dev set, the more likely you will overfit to that too; so sometimes it's useful to have dev1 (for tuning hyperparameters), dev2 (for measuring overall progress), ... depending on how many experiments you're going to run 
+- The **test** set is used for final evaluation 
+- More useful remarks from the Stanford NLP group [here](https://web.stanford.edu/class/archive/cs/cs224n/cs224n.1194/readings/final-project-practical-tips.pdf)
+
+### Some Examples of Reviews
+
+```{r}
+# 5 examples of positive reviews 
+set.seed(123)
+train_imdb %>%
+  filter(label == "pos") %>%
+  sample_n(3) %>%
+  pull(text)
+```
+
+```{r}
+# 5 examples of negative reviews 
+set.seed(123)
+train_imdb %>%
+  filter(label == "neg") %>%
+  sample_n(3) %>%
+  pull(text)
+```
+
+### Mark-up and Text Cleaning 
+
+- Presence of things like `\u0085` and `<br />`
+- May want to remove these 
+
+```{r}
+simple_clean <- function(text){
+  str_replace_all(text, '\u0085|<br />', '')
+}
+
+simple_clean("or something?\u0085<br /><br />")
+```
+
+- I'll deal with this and related issues properly later 
+
+### Tokenization and Review Length 
+
+- How long are the reviews?  And are length distributions different by label?  
+- Need to define some measure of length: characters, words, etc.
+- If words, we need to define what we mean by a 'word' 
+
+```{r fig.width=5, fig.height=2}
+# get the review legnths 
+review_lengths <- lengths(tokenize_words(train_imdb$text), use.names = F)
+# stick into a dataframe
+review_lengths_labels_df <- tibble(label = train_imdb$label, number_of_words = review_lengths)
+# plot counts by label 
+review_lengths_labels_df %>% ggplot(aes(x = number_of_words, fill = label)) +
+  geom_histogram(bins = 50, alpha = 0.7)
+```
+
+### A few notes on tokenization, stemming, stopwords, ... 
+
+### Negation Rates (1)
+
+- How frequently does clausal negation occur?  Are there differences by label?  
+
+```{r}
+# get negative rates for each review (in number of words per million)
+
+list_of_negatives <- c("not", "never", "no", "nowhere", "nobody", "yet", "hardly", "barely")
+contracted_negative_pattern <- "n't"
+
+mean_negative_rate <- train_imdb %>% 
+                        mutate(review_id = 1:nrow(train_imdb)) %>%
+                        unnest_tokens(words, text) %>%
+                        mutate(is_negative = (words %in% list_of_negatives)|
+                                 str_detect(words, contracted_negative_pattern)) %>%
+                        select(review_id, is_negative) %>%
+                        group_by(review_id) %>%
+                        summarize(mean_negative_rate = mean(is_negative)) %>%
+                        mutate(mean_negative_rate = mean_negative_rate * 10^6) %>%
+                        select(mean_negative_rate)
+
+mean_negative_rate_df <- tibble(mean_negative_rate, label = train_imdb$label)
+                      
+```
+
+### Negation Rates (2)
+
+- How frequently does clausal negation occur?  Are there differences by label?  
+
+```{r fig.width=5, fig.height=2}
+mean_negative_rate_df %>% ggplot(aes(x = mean_negative_rate, fill = label)) +
+  geom_histogram(bins = 50, alpha = 0.7)
+```
+
+### Handling negation 
+
+- Given that negation is quite frequent, it should be flagged:
+    - I really did not like that movie $\rightarrow$ I really did not like that movie
+- A good baseline is to use Das's approach.. 
+
+### Words that distinguish the classes (1)
+
+```{r}
+pos_neg_ratio_df <- train_imdb %>%
+  unnest_tokens(word, text) %>%
+  group_by(label) %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 25) %>%
+  pivot_wider(names_from = label, values_from = n) %>%
+  mutate(pos = replace_na(pos, 1) + 1, neg = replace_na(neg, 1) + 1) %>%
+  mutate(pos_neg_ratio = log(pos/neg)) %>%
+  arrange(desc(pos_neg_ratio)) 
+
+head(pos_neg_ratio_df)
+```
+
+### Words that distinguish the classes (2)
+
+```{r fig.width=5, fig.height=2}
+pos_neg_ratio_df %>%
+  head(10) %>%
+  ggplot(aes(x = reorder(word, pos_neg_ratio), y = pos_neg_ratio)) +
+  geom_bar(stat = "identity", fill = POS_COLOR, alpha = 0.7) +
+  coord_flip() +
+  labs(x="", y = "log[count(positive+1)/count(negative+1)]", 
+       title = "words associated with +'ve reviews") 
+```
+
+
+
+### Words that distinguish the classes (3)
+
+```{r fig.width=5, fig.height=2}
+pos_neg_ratio_df %>%
+  tail(10) %>%
+  ggplot(aes(x = reorder(word, -pos_neg_ratio), y = pos_neg_ratio)) +
+  geom_bar(stat = "identity", fill = NEG_COLOR, alpha = 0.7) +
+  coord_flip() +
+  labs(x="", y = "log[count(positive+1)/count(negative+1]", 
+       title = "words associated with -'ve reviews") 
+```
+
+## Evaluation Metric
+
+How are we going to decide whether our system is performant or not? Accuracy is often used.  We will use Macro F1 as that is fairly common in NLP, but you should be aware that other metrics (Brier, AUROC, ...) might be more appropriate for the problem.  
+
+This is available in the `yardstick` package as `f_meas(estimator = "macro")` or `f_meas_vec(estimator = "macro")`, depending on how your results are structured: 
+
+```{r}
+# make up some data and fake predictions  
+y_true <- factor(c(1,1,1,1,1,0,0,0,0,0))
+y_pred <- factor(c(0,1,1,0,0,1,1,1,1,0))
+
+# if your results are in a dataset 
+results <- tibble(y_true, y_pred)
+f_meas(results, y_true, y_pred, estimator = "macro")
+
+# as vectors 
+f_meas_vec(y_true, y_pred, estimator = "macro")
+```
+
+
+
+## Models 
+
+- Recall here we will look at:
+    1. a lexicon+rule based approach
+    2. a traditional machine learning approach (& comparing models)
+          + unigrams + logistic regression
+          + unigrams + bigrams + logistic regression
+          + handcrafted features 
+    3. a simple feed-forward neural network approach
+    
+### Lexicon + Rule Based Approach (1)
+#### Lexicon 
+
+We use Bing Liu's lexicon, available in the `tidytext` package with the following call: 
+```{r}
+liu_lex <- get_sentiments("bing")
+head(liu_lex)
+```
+
+```{r}
+liu_lex %>% 
+  count(sentiment)
+```
+
+There's a variation of it, containing 2003 positive words and 4780 negative words, in the project folder. This version has a few duplicates and words that occur in both positive and negative lists. 
+
+### Constructing the sentiment Rule
+
+```{r}
+get_sentiment_score <- function(data){
+  tokens <- unlist(tokenize_words(data))
+  tokens_df <- tibble(word = tokens)
+  sentiment_tokens <- inner_join(tokens_df, liu_lex, by = "word")
+  sentiment_tokens$sentiment <- recode(sentiment_tokens$sentiment, "positive" = 1, "negative" = 0)
+  score <- mean(sentiment_tokens$sentiment) 
+  if (is.nan(score)){
+    return(sample(c("pos", "neg"), 1))
+     }
+  else if (score > 0.5){
+    return("pos")
+    } 
+  else {
+    return("neg")
+    }
+  }
+```
+
+### Applying the sentiment rule
+
+There is no training to be done, because we used a hand-crafted rule, so we can apply directly to the `train` and `dev` sets and get some scores... 
+
+```{r}
+# for the training data 
+train_lexicon_preds <- sapply(train_imdb$text, get_sentiment_score, USE.NAMES = FALSE) 
+train_lexicon_result <- f_meas_vec(factor(train_imdb$label), factor(train_lexicon_preds), 
+                                   estimator = "macro")
+sprintf("Train macro F1 using lexicon approach: %.4f", train_lexicon_result)
+```
+
+
+```{r}
+# for the test data 
+dev_lexicon_preds <- sapply(dev_imdb$text, get_sentiment_score, USE.NAMES = FALSE) 
+dev_lexicon_result <- f_meas_vec(factor(dev_imdb$label), factor(dev_lexicon_preds), 
+                                 estimator = "macro")
+sprintf("Dev  macro F1 using lexicon approach: %.4f", dev_lexicon_result)
+```
+
+## Traditional Machine Learning 
+### Unigram (1) - Preprocessing 
+
+```{r}
+# set up preprocessing 
+
+# recipe
+unigram_lr_rec <- recipe(label ~ text, data = train_imdb) %>%
+    step_tokenize(text) %>%
+    step_tokenfilter(text, max_tokens = 5000) %>%
+    step_tf(text) %>%
+    step_normalize(all_predictors())
+      # step_tokenize(text) %>%
+      # step_tokenfilter(text, max_tokens = 2000) %>%
+      # step_tf(text, weight_scheme = "binary") 
+
+# evaluate the recipe 
+unigram_lr_prep <- prep(unigram_lr_rec)
+
+# inspect it 
+unigram_lr_prep
+```
+
+### Unigram 
+#### Model set up
+
+```{r}
+ridge_spec <- logistic_reg(penalty = tune(), mixture = 0) %>%
+  set_engine("glmnet")
+
+ridge_wf <- workflow() %>%
+  add_recipe(unigram_lr_rec) %>%
+  add_model(ridge_spec)
+
+ridge_wf
+```
+
+### Unigram 
+#### Model tuning 
+
+```{r}
+# set of possible regularization parameters to try
+lambda_grid <- grid_regular(penalty(), levels = 25)
+```
+
+```{r}
+# set of resampled data to fit and evaluate all these models
+set.seed(123)
+imdb_train_folds <- bootstraps(train_imdb, times = 3, strata = label)
+imdb_train_folds
+```
+
+###
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(123)
+ridge_grid <- tune_grid(
+  ridge_wf,
+  resamples = imdb_train_folds,
+  grid = lambda_grid,
+  metrics = metric_set(f_meas)
+)
+
+```
+
+### 
+```{r}
+ridge_grid %>%
+  collect_metrics()
+```
+
+
+```{r}
+ridge_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  scale_x_log10()
+```
+
+
+
+
+
+
+
+### Unigram + Bigram + Handcrafted features
+
+- length of the review
+- number of words in Liu's positive lexicon, negative lexicon, and their ratio
+- number of exclamation marks
+- number of words with lengthening
+- number of all caps
+- add in features from https://textrecipes.tidymodels.org/reference/step_textfeature.html
+
+
+```{r}
+# set up preprocessing 
+
+# recipe
+unigram_lr_rec <- recipe(label ~ text, data = train_imdb) %>%
+    step_textfeature(text, keep_original_cols = TRUE) %>%
+    step_tokenize(text) %>%
+    step_ngram(text, min_num_tokens = 1, num_tokens = 3) %>%
+    step_tokenfilter(text, max_tokens = 5000) %>%
+    step_tf(text) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_predictors())
+
+# evaluate the recipe 
+unigram_lr_prep <- prep(unigram_lr_rec)
+
+# inspect it 
+unigram_lr_prep
+```
+
+```{r}
+ridge_spec <- logistic_reg(penalty = tune(), mixture = 0) %>%
+  set_engine("glmnet")
+
+ridge_wf <- workflow() %>%
+  add_recipe(unigram_lr_rec) %>%
+  add_model(ridge_spec)
+
+ridge_wf
+```
+
+### Unigram 
+#### Model tuning 
+
+```{r}
+# set of possible regularization parameters to try
+lambda_grid <- grid_regular(penalty(), levels = 25)
+```
+
+```{r}
+# set of resampled data to fit and evaluate all these models
+set.seed(123)
+imdb_train_folds <- bootstraps(train_imdb, times = 3, strata = label)
+imdb_train_folds
+```
+
+###
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(123)
+ridge_grid <- tune_grid(
+  ridge_wf,
+  resamples = imdb_train_folds,
+  grid = lambda_grid,
+  metrics = metric_set(f_meas)
+)
+
+```
+
+### 
+```{r}
+ridge_grid %>%
+  collect_metrics()
+```
+
+
+```{r}
+ridge_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  scale_x_log10()
+```
+
+
+
+
+
+
+
